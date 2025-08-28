@@ -9,9 +9,9 @@ import torch
 import torch.nn as nn
 
 
-# ========================== EMNIST MODEL DEFINITION ==========================
+# ========================== EMNIST MODEL ==========================
 class SmallCNN(nn.Module):
-    """A compact CNN for EMNIST Letters (26 classes: A-Z)."""
+    """Compact CNN for EMNIST Letters (A–Z)."""
     def __init__(self, num_classes=26):
         super().__init__()
         self.net = nn.Sequential(
@@ -40,7 +40,6 @@ _emnist_device = torch.device(
     else ("mps" if torch.backends.mps.is_available() else "cpu")
 )
 
-
 def load_emnist_model():
     """Lazy-load the EMNIST model once and keep it in memory."""
     global _emnist_model
@@ -54,27 +53,61 @@ def load_emnist_model():
     return _emnist_model
 
 
-# ========================== DRAWING / UI SETTINGS ==========================
-DRAW_THICKNESS   = 10       # Thicker stroke helps recognition
-PINCH_THRESHOLD  = 0.07     # Thumb-index tip normalized distance threshold
-SMOOTHING        = 0.4      # EMA for fingertip (0..1): higher = more smoothing
+# ========================== DRAW/APP SETTINGS ==========================
+DRAW_THICKNESS   = 10
+PINCH_THRESHOLD  = 0.07     # pinch (thumb-index) threshold
+SMOOTHING        = 0.4      # fingertip EMA (0..1)
 SAVE_DIR         = "samples"
+NOTES_DIR        = "notes"
 os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(NOTES_DIR, exist_ok=True)
 
-mp_hands    = mp.solutions.hands
-mp_drawing  = mp.solutions.drawing_utils
+# live text buffer (builds your note on screen)
+TEXT_BUFFER = []  # list of characters
+
+mp_hands   = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
 
 
-# ========================== GEOMETRY HELPERS ==========================
+# ========================== HELPERS ==========================
 def norm_dist(a, b):
     """Normalized distance between two Mediapipe landmarks in [0..1] coords."""
     return np.linalg.norm(np.array([a.x - b.x, a.y - b.y]))
 
+def get_text_string():
+    """Join the TEXT_BUFFER into a single string (for saving)."""
+    return "".join(TEXT_BUFFER)
 
-# ========================== PREPROCESS & SAVE ==========================
+def save_textbuffer_to_file():
+    """Save current TEXT_BUFFER to a timestamped .txt in NOTES_DIR."""
+    content = get_text_string()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(NOTES_DIR, f"note_{ts}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
+
+def draw_textbuffer_overlay(img):
+    """
+    Render the live text buffer at the bottom-left of the window.
+    Shows at most the last ~2 lines (for readability).
+    """
+    h, w = img.shape[:2]
+    text = get_text_string()
+    # split into lines so \n is respected; show the last two lines
+    lines = text.split("\n")
+    last_lines = lines[-2:] if len(lines) >= 2 else lines
+    y = h - 40  # start a bit above the bottom
+    for line in last_lines:
+        cv2.putText(img, f"Text: {line}" if line else "Text:",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (50, 230, 50), 2, cv2.LINE_AA)
+        y += 28  # line spacing
+
+
+# ========================== PREPROCESS & SAVE (MNIST-style) ==========================
 def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # Light blur then binary threshold; canvas is black, strokes are white.
     g = cv2.GaussianBlur(gray, (3, 3), 0)
     _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY)
 
@@ -85,27 +118,24 @@ def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16
     x1, x2 = xs.min(), xs.max()
     y1, y2 = ys.min(), ys.max()
 
-    # Add a safety margin around bbox
+    # safe bbox with margin
     y1 = max(0, y1 - margin); x1 = max(0, x1 - margin)
     y2 = min(bw.shape[0]-1, y2 + margin); x2 = min(bw.shape[1]-1, x2 + margin)
     crop = bw[y1:y2+1, x1:x2+1]
 
-    # Ensure black background / white foreground convention
-    # If the crop is mostly bright, invert:
+    # enforce black BG / white FG
     if crop.mean() >= 90:
         crop = 255 - crop
 
-    # Deskew based on image moments (like MNIST classic pipeline)
+    # deskew (classic MNIST trick)
     m = cv2.moments(crop)
     if abs(m['mu02']) > 1e-2:
         skew = m['mu11'] / m['mu02']
         M = np.float32([[1, skew, -0.5 * skew * crop.shape[0]], [0, 1, 0]])
-        crop = cv2.warpAffine(
-            crop, M, (crop.shape[1], crop.shape[0]),
-            flags=cv2.INTER_LINEAR, borderValue=0
-        )
+        crop = cv2.warpAffine(crop, M, (crop.shape[1], crop.shape[0]),
+                              flags=cv2.INTER_LINEAR, borderValue=0)
 
-    # Scale longest side to 20 (keep aspect), then pad to 28
+    # scale to 20 on the longest side
     h, w = crop.shape
     if h > w:
         new_h = 20
@@ -115,12 +145,13 @@ def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16
         new_h = max(1, int(round(h * (20.0 / w))))
     resized20 = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+    # pad to 28x28
     canvas28 = np.zeros((28, 28), dtype=np.uint8)
     x_off = (28 - new_w) // 2
     y_off = (28 - new_h) // 2
     canvas28[y_off:y_off+new_h, x_off:x_off+new_w] = resized20
 
-    # Re-center by mass (move centroid to 14,14)
+    # re-center by mass
     m2 = cv2.moments(canvas28)
     if m2['m00'] > 0:
         cx = int(m2['m10'] / m2['m00'])
@@ -128,20 +159,17 @@ def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16
         shiftx = int(round(14 - cx))
         shifty = int(round(14 - cy))
         M2 = np.float32([[1, 0, shiftx], [0, 1, shifty]])
-        canvas28 = cv2.warpAffine(
-            canvas28, M2, (28, 28),
-            flags=cv2.INTER_LINEAR, borderValue=0
-        )
+        canvas28 = cv2.warpAffine(canvas28, M2, (28, 28),
+                                  flags=cv2.INTER_LINEAR, borderValue=0)
 
-    # Save a large human-readable preview and the final 28x28 model input
+    # save preview (big) and model image (28x28)
     preview = cv2.resize(canvas28, (preview_size, preview_size), interpolation=cv2.INTER_NEAREST)
 
     base = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path_crop  = os.path.join(save_dir, f"{base}_crop.png")    # here stores the 28x28 final matrix
+    path_crop  = os.path.join(save_dir, f"{base}_crop.png")    # stores final 28x28
     path_prev  = os.path.join(save_dir, f"{base}_preview.png")
     path_model = os.path.join(save_dir, f"{base}_28x28.png")
 
-    # For clarity, store the 28x28 image in both 'crop' and 'model' (same data)
     cv2.imwrite(path_crop,  canvas28)
     cv2.imwrite(path_prev,  preview)
     cv2.imwrite(path_model, canvas28)
@@ -149,28 +177,24 @@ def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16
     return {"crop": path_crop, "preview": path_prev, "model": path_model, "side": 28}
 
 
-# ========================== PREDICT WITH TTA ==========================
+# ========================== PREDICT (TTA) ==========================
 def predict_emnist_from_png(png_path, topk=3, show_debug=False):
+  
     img = cv2.imread(png_path, cv2.IMREAD_GRAYSCALE)
     if img is None or img.shape != (28, 28):
         print("Invalid 28x28 image path:", png_path)
         return None
 
-    # Ensure black background / white strokes
     base = img if img.mean() < 90 else (255 - img)
 
-    # Build TTA variants
-    variants = []
-    variants.append(base)
-    variants.append(cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE))
-    variants.append(cv2.rotate(base, cv2.ROTATE_180))
-    variants.append(cv2.rotate(base, cv2.ROTATE_90_CLOCKWISE))
-
+    variants = [base,
+                cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE),
+                cv2.rotate(base, cv2.ROTATE_180),
+                cv2.rotate(base, cv2.ROTATE_90_CLOCKWISE)]
     k = np.ones((2, 2), np.uint8)
-    variants.append(cv2.dilate(base, k, iterations=1))
-    variants.append(cv2.erode(base, k, iterations=1))
+    variants += [cv2.dilate(base, k, iterations=1),
+                 cv2.erode(base, k, iterations=1)]
 
-    # Accumulate probabilities
     with torch.no_grad():
         model = load_emnist_model()
         probs_sum = None
@@ -191,18 +215,12 @@ def predict_emnist_from_png(png_path, topk=3, show_debug=False):
             tops = [(chr(ord('A') + int(i)), float(probs[i])) for i in top_idx]
             print("Top-{}: {}".format(topk, tops))
 
-        if show_debug:
-            zoom = cv2.resize(base, (280, 280), interpolation=cv2.INTER_NEAREST)
-            cv2.imshow("EMNIST input (normalized)", zoom)
-            cv2.waitKey(200)
-
-        print(f"Prediction: {pred_char}  (conf={float(probs[idx]):.2f})")
+        print(f"Prediction: {pred_char} (conf={float(probs[idx]):.2f})")
         return pred_char
 
 
-# ========================== MAIN LOOP (HAND DRAW + PREDICT) ==========================
+# ========================== MAIN LOOP (DRAW + TEXT) ==========================
 def main():
-    # Open camera
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Camera did not open.")
@@ -221,7 +239,6 @@ def main():
     drawing = False
     color = (255, 255, 255)
 
-    # Mediapipe hand tracker
     with mp_hands.Hands(
         max_num_hands=1,
         model_complexity=1,
@@ -246,7 +263,6 @@ def main():
                 idx_tip = hand.landmark[8]   # index fingertip
                 thb_tip = hand.landmark[4]   # thumb tip
 
-                # Pinch detection: distance below threshold => pen-down
                 d = norm_dist(idx_tip, thb_tip)
                 pinch_now = d < PINCH_THRESHOLD
 
@@ -255,7 +271,7 @@ def main():
 
                 mp_drawing.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
 
-            # Finger smoothing + drawing on a separate canvas
+            # fingertip smoothing + draw
             if index_tip_px is not None:
                 if filtered_point is None:
                     filtered_point = np.array(index_tip_px, dtype=np.float32)
@@ -278,63 +294,73 @@ def main():
                     cv2.line(canvas, last_point, ip, color, DRAW_THICKNESS, cv2.LINE_AA)
                     last_point = ip
 
-            # Blend camera frame and drawing
             blend = cv2.addWeighted(frame, 0.7, canvas, 0.9, 0)
 
-            # On-screen UI
+            # UI + text buffer overlay
             cv2.putText(
                 blend,
-                "Pinch=draw   N=save   E=predict   C=clear   Q=quit",
+                "Pinch=draw   N=save   E=predict->Text   Space/Enter/Backspace   S=save.txt   C=clear   Q=quit",
                 (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (20, 220, 20),
-                2,
-                cv2.LINE_AA
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (20, 220, 20), 2, cv2.LINE_AA
             )
             status_color = (0, 255, 0) if drawing else (0, 0, 255)
             cv2.rectangle(blend, (10, 45), (30, 65), status_color, -1)
 
-            cv2.imshow("Air-Draw Notepad (EMNIST)", blend)
+            # draw current text at bottom
+            draw_textbuffer_overlay(blend)
+
+            cv2.imshow("Air-Draw Notepad", blend)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):      # Quit
                 break
+
             elif key == ord('c'):    # Clear canvas
                 canvas[:] = 0
-            elif key == ord('n'):    # Save current drawing (with MNIST-style preprocessing)
+
+            elif key == ord('n'):    # Save current glyph (MNIST-style)
                 out = preprocess_and_save(canvas)
                 if out:
-                    print(f"Saved (28x28/model): {out['model']}")
-                    print(f"Saved (preview)   : {out['preview']}")
+                    print(f"Saved 28x28: {out['model']}")
+                    print(f"Saved preview: {out['preview']}")
                     canvas[:] = 0
                 else:
                     print("No ink to save.")
-            elif key == ord('e'):    # Predict last saved 28x28 using EMNIST
+
+            elif key == ord('e'):    # Predict last saved glyph -> append to TEXT_BUFFER
                 import glob
                 paths = sorted(
                     glob.glob(os.path.join(SAVE_DIR, "*_28x28.png")),
                     key=os.path.getmtime
                 )
                 if not paths:
-                    print("Save a sample with 'N' first.")
+                    print("Save a glyph with 'N' first.")
                 else:
                     last28 = paths[-1]
                     pred = predict_emnist_from_png(last28, topk=3, show_debug=False)
                     if pred is not None:
-                        # Briefly overlay prediction on the live view
-                        cv2.putText(
-                            blend, f"PRED: {pred}", (10, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA
-                        )
-                        cv2.imshow("Air-Draw Notepad (EMNIST)", blend)
-                        cv2.waitKey(500)
+                        TEXT_BUFFER.append(pred)
+
+            elif key == 32:          # Space
+                TEXT_BUFFER.append(" ")
+
+            elif key == 13:          # Enter (newline)
+                TEXT_BUFFER.append("\n")
+
+            elif key == 8:           # Backspace
+                if TEXT_BUFFER:
+                    TEXT_BUFFER.pop()
+
+            elif key == ord('s'):    # Save current text to notes/*.txt
+                path = save_textbuffer_to_file()
+                print("Saved note:", path)
 
     cap.release()
     cv2.destroyAllWindows()
 
 
-# Mediapipe init after function definitions (so it's available for 'with' block)
+# keep mp_hands available after defs
 mp_hands = mp.solutions.hands
 
 if __name__ == "__main__":
