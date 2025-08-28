@@ -3,6 +3,61 @@ import os
 import numpy as np
 import mediapipe as mp
 from datetime import datetime
+import torch
+import torch.nn as nn
+
+
+# ---- EMNIST model tanımı ----
+class SmallCNN(nn.Module):
+    def __init__(self, num_classes=26):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Linear(64*7*7, 256), nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 26)
+        )
+    def forward(self, x): return self.net(x)
+
+EMNIST_MODEL_PATH = "emnist_letters_cnn.pt"
+_emnist_model = None
+_emnist_device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+def load_emnist_model():
+    global _emnist_model
+    if _emnist_model is None:
+        m = SmallCNN(num_classes=26).to(_emnist_device)
+        ckpt = torch.load(EMNIST_MODEL_PATH, map_location=_emnist_device)
+        m.load_state_dict(ckpt["state_dict"], strict=True)
+        m.eval()
+        _emnist_model = m
+        print("EMNIST model loaded.")
+    return _emnist_model
+
+def tensorize_our_28x28(img28):
+    # img28: uint8 (28x28), siyah zemin (0) üzerinde beyaz karakter (255) varsayımı
+    t = torch.from_numpy(img28).float() / 255.0
+    t = (t - 0.1307) / 0.3081
+    return t.unsqueeze(0).unsqueeze(0)  # (1,1,28,28)
+
+def predict_emnist_from_png(png_path):
+    import cv2
+    img = cv2.imread(png_path, cv2.IMREAD_GRAYSCALE)
+    if img is None or img.shape != (28, 28):
+        print("Invalid 28x28 image path:", png_path)
+        return None
+    x = tensorize_our_28x28(img).to(_emnist_device)
+    with torch.no_grad():
+        model = load_emnist_model()
+        logits = model(x)
+        idx = logits.argmax(1).item()  # 0..25
+        return chr(ord('A') + idx)
 
 
 DRAW_THICKNESS = 6
@@ -170,6 +225,22 @@ def main():
                     canvas[:] = 0
                 else:
                     print("Kaydedilecek çizim bulunamadı.")
+            elif key == ord('e'):
+                import glob,os
+                paths = sorted(glob.glob(os.path.join(SAVE_DIR, "*_28x28.png")), key=os.path.getmtime)
+                if not paths:
+                    print("save a text with N first")
+                else: 
+                    last28 = paths[-1]
+                    pred = predict_emnist_from_png(last28)
+                    if pred is not None:
+                        print(f"EMNIST prediction: {pred}")
+                    # Ekrana da kısa süre göster
+                    cv2.putText(blend, f"PRED: {pred}", (10, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.imshow("Air-Draw Notepad (EMNIST)", blend)
+                    cv2.waitKey(500)
+
 
     cap.release()
     cv2.destroyAllWindows()
