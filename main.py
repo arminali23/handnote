@@ -59,6 +59,8 @@ PINCH_THRESHOLD  = 0.07     # pinch (thumb-index) threshold
 SMOOTHING        = 0.4      # fingertip EMA (0..1)
 SAVE_DIR         = "samples"
 NOTES_DIR        = "notes"
+AUTO_PREDICT     = True     # after N, automatically predict & append to TEXT_BUFFER
+
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(NOTES_DIR, exist_ok=True)
 
@@ -94,7 +96,6 @@ def draw_textbuffer_overlay(img):
     """
     h, w = img.shape[:2]
     text = get_text_string()
-    # split into lines so \n is respected; show the last two lines
     lines = text.split("\n")
     last_lines = lines[-2:] if len(lines) >= 2 else lines
     y = h - 40  # start a bit above the bottom
@@ -107,6 +108,15 @@ def draw_textbuffer_overlay(img):
 
 # ========================== PREPROCESS & SAVE (MNIST-style) ==========================
 def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16):
+    """
+    Convert current canvas drawing into MNIST-like 28x28 for EMNIST:
+      1) Threshold to BW (white strokes on black background).
+      2) Crop to bounding box + 'margin'.
+      3) Deskew (image moments).
+      4) Scale longest side to 20, then pad to 28x28.
+      5) Center by mass (centroid to center).
+      6) Save preview (for human) and final 28x28 (for model).
+    """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     g = cv2.GaussianBlur(gray, (3, 3), 0)
     _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY)
@@ -132,8 +142,10 @@ def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16
     if abs(m['mu02']) > 1e-2:
         skew = m['mu11'] / m['mu02']
         M = np.float32([[1, skew, -0.5 * skew * crop.shape[0]], [0, 1, 0]])
-        crop = cv2.warpAffine(crop, M, (crop.shape[1], crop.shape[0]),
-                              flags=cv2.INTER_LINEAR, borderValue=0)
+        crop = cv2.warpAffine(
+            crop, M, (crop.shape[1], crop.shape[0]),
+            flags=cv2.INTER_LINEAR, borderValue=0
+        )
 
     # scale to 20 on the longest side
     h, w = crop.shape
@@ -159,8 +171,10 @@ def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16
         shiftx = int(round(14 - cx))
         shifty = int(round(14 - cy))
         M2 = np.float32([[1, 0, shiftx], [0, 1, shifty]])
-        canvas28 = cv2.warpAffine(canvas28, M2, (28, 28),
-                                  flags=cv2.INTER_LINEAR, borderValue=0)
+        canvas28 = cv2.warpAffine(
+            canvas28, M2, (28, 28),
+            flags=cv2.INTER_LINEAR, borderValue=0
+        )
 
     # save preview (big) and model image (28x28)
     preview = cv2.resize(canvas28, (preview_size, preview_size), interpolation=cv2.INTER_NEAREST)
@@ -179,7 +193,15 @@ def preprocess_and_save(img_bgr, save_dir=SAVE_DIR, preview_size=1024, margin=16
 
 # ========================== PREDICT (TTA) ==========================
 def predict_emnist_from_png(png_path, topk=3, show_debug=False):
-  
+    """
+    EMNIST prediction with test-time augmentation:
+      - normalize polarity
+      - rotations: 0/90/180/270
+      - light morphology (dilate/erode)
+      - average softmax probs
+    Returns predicted char (A–Z).
+    Also prints Top-K with confidences.
+    """
     img = cv2.imread(png_path, cv2.IMREAD_GRAYSCALE)
     if img is None or img.shape != (28, 28):
         print("Invalid 28x28 image path:", png_path)
@@ -187,13 +209,17 @@ def predict_emnist_from_png(png_path, topk=3, show_debug=False):
 
     base = img if img.mean() < 90 else (255 - img)
 
-    variants = [base,
-                cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE),
-                cv2.rotate(base, cv2.ROTATE_180),
-                cv2.rotate(base, cv2.ROTATE_90_CLOCKWISE)]
+    variants = [
+        base,
+        cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE),
+        cv2.rotate(base, cv2.ROTATE_180),
+        cv2.rotate(base, cv2.ROTATE_90_CLOCKWISE)
+    ]
     k = np.ones((2, 2), np.uint8)
-    variants += [cv2.dilate(base, k, iterations=1),
-                 cv2.erode(base, k, iterations=1)]
+    variants += [
+        cv2.dilate(base, k, iterations=1),
+        cv2.erode(base, k, iterations=1)
+    ]
 
     with torch.no_grad():
         model = load_emnist_model()
@@ -221,6 +247,8 @@ def predict_emnist_from_png(png_path, topk=3, show_debug=False):
 
 # ========================== MAIN LOOP (DRAW + TEXT) ==========================
 def main():
+    global AUTO_PREDICT  # we'll toggle this via key 'A'
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Camera did not open.")
@@ -299,9 +327,9 @@ def main():
             # UI + text buffer overlay
             cv2.putText(
                 blend,
-                "Pinch=draw   N=save   E=predict->Text   Space/Enter/Backspace   S=save.txt   C=clear   Q=quit",
+                "Pinch=draw   N=save(auto)   E=predict->Text   A=auto ON/OFF   U=undo   Space/Enter/Backspace   S=save.txt   C=clear   Q=quit",
                 (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (20, 220, 20), 2, cv2.LINE_AA
             )
             status_color = (0, 255, 0) if drawing else (0, 0, 255)
@@ -316,15 +344,28 @@ def main():
             if key == ord('q'):      # Quit
                 break
 
-            elif key == ord('c'):    # Clear canvas
+            elif key == ord('c'):    # Clear canvas (only drawing)
                 canvas[:] = 0
 
-            elif key == ord('n'):    # Save current glyph (MNIST-style)
+            elif key == ord('n'):    # Save glyph -> (optionally) auto predict
                 out = preprocess_and_save(canvas)
                 if out:
                     print(f"Saved 28x28: {out['model']}")
                     print(f"Saved preview: {out['preview']}")
-                    canvas[:] = 0
+                    canvas[:] = 0  # clear draw layer
+
+                    if AUTO_PREDICT:
+                        last28 = out['model']  # freshly saved path
+                        pred = predict_emnist_from_png(last28, topk=3, show_debug=False)
+                        if pred is not None:
+                            TEXT_BUFFER.append(pred)
+                            # brief on-screen feedback
+                            cv2.putText(
+                                blend, f"PRED: {pred}", (10, 80),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA
+                            )
+                            cv2.imshow("Air-Draw Notepad", blend)
+                            cv2.waitKey(300)
                 else:
                     print("No ink to save.")
 
@@ -341,6 +382,16 @@ def main():
                     pred = predict_emnist_from_png(last28, topk=3, show_debug=False)
                     if pred is not None:
                         TEXT_BUFFER.append(pred)
+
+            elif key == ord('a'):    # Toggle auto-predict
+                AUTO_PREDICT = not AUTO_PREDICT
+                state = "ON" if AUTO_PREDICT else "OFF"
+                print(f"Auto-Predict: {state}")
+
+            elif key == ord('u'):    # Undo last char in text buffer
+                if TEXT_BUFFER:
+                    removed = TEXT_BUFFER.pop()
+                    print(f"Undo: removed '{removed}'")
 
             elif key == 32:          # Space
                 TEXT_BUFFER.append(" ")
@@ -359,9 +410,6 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-
-# keep mp_hands available after defs
-mp_hands = mp.solutions.hands
 
 if __name__ == "__main__":
     main()
