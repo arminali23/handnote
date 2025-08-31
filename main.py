@@ -318,10 +318,9 @@ def main():
             # UI
             cv2.putText(
                 blend,
-                "Pinch=draw | N=save(auto E) | E=predict->Text | A=auto-pred ON/OFF | T=auto-seg ON/OFF | U=undo | Space/Enter/Backspace | S=save.txt | C=clear | Q=quit",
+                "Pinch=draw | N=save(auto) | E=predict->Text | A/T toggle | U undo | Space/Enter/Backspace | digits & . , ! ? : ; | S save.txt | C clear | Q quit",
                 (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                (20, 220, 20), 2, cv2.LINE_AA
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (20,220,20), 2, cv2.LINE_AA
             )
             status_color = (0, 255, 0) if drawing else (0, 0, 255)
             cv2.rectangle(blend, (10, 45), (30, 65), status_color, -1)
@@ -416,6 +415,21 @@ def main():
             elif key in (ord('s'), ord('S')):
                 path = save_textbuffer_to_file()
                 print("Saved note:", path)
+                
+            elif key in [ord(str(d)) for d in range(10)]:
+                TEXT_BUFFER.append(chr(key))
+            elif key == ord('.'):
+                TEXT_BUFFER.append(".")
+            elif key == ord(','):
+                TEXT_BUFFER.append(",")
+            elif key == ord('!'):
+                TEXT_BUFFER.append("!")
+            elif key == ord('?'):
+                TEXT_BUFFER.append("?")
+            elif key == ord(':'):
+                TEXT_BUFFER.append(":")
+            elif key == ord(';'):
+                TEXT_BUFFER.append(";")
 
     cap.release()
     cv2.destroyAllWindows()
