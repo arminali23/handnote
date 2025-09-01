@@ -39,7 +39,7 @@ index.html              # Web frontend
 
 ###  Setup & Run
 
-#### 1. Clone
+#### Clone
 ```bash
 git clone https://github.com/yourusername/handnote.git
 cd handnote/webapp
