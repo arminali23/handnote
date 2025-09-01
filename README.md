@@ -5,8 +5,6 @@ The app recognizes your characters using a CNN trained on the EMNIST dataset, bu
 
 ---
 
-## 🌍 English
-
 ### Features
 -  **Canvas Drawing**: Write letters with mouse/touch, then predict with one click.  
 -  **Webcam + Pinch**: Draw in the air (thumb-index pinch). Toggle webcam mode.  
