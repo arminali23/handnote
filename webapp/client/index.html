@@ -1,0 +1,245 @@
+<!-- webapp/client/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>HandNote Web</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background:#0b0c10; color:#e5e7eb;}
+    .wrap { max-width: 1000px; margin: 24px auto; padding: 0 16px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+    canvas { background:#000; border:1px solid #333; border-radius:12px; touch-action:none; }
+    video { width: 320px; height: 240px; border-radius:12px; border:1px solid #333; background:#111; object-fit:cover; }
+    button { border:0; border-radius:10px; padding:10px 14px; font-weight:600; cursor:pointer; background:#1f2937; color:#e5e7eb; }
+    button:hover { filter: brightness(1.15); }
+    .pill { padding:4px 8px; border-radius:999px; background:#111827; border:1px solid #374151; }
+    .textpane { white-space:pre-wrap; min-height:140px; padding:12px; border-radius:12px; background:#0f172a; border:1px solid #334155; font-size:18px; line-height:1.6; }
+    .toolbar { gap:8px; display:flex; flex-wrap:wrap; align-items:center; }
+    .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding:1px 6px; border-radius:6px; background:#111827; border:1px solid #374151; }
+  </style>
+  <!-- MediaPipe Hands (Web) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <h2>✍️ HandNote (Web)</h2>
+
+    <div class="row">
+      <div>
+        <canvas id="pad" width="512" height="512"></canvas>
+        <div style="margin-top:10px" class="toolbar">
+          <button id="btnPredict">Predict</button>
+          <button id="btnUndo">Undo</button>
+          <button id="btnClear">Clear</button>
+          <button id="btnSpace">Space</button>
+          <button id="btnEnter">Enter</button>
+          <button id="btnSave">Save .txt</button>
+          <button id="btnWebcam">Toggle Webcam</button>
+          <span class="pill" id="status">Ready</span>
+        </div>
+        <div class="pill" style="margin-top:8px">
+          Draw a single letter, press <span class="kbd">Predict</span>. Top-3 shows;
+          choose with <span class="kbd">1</span>/<span class="kbd">2</span>/<span class="kbd">3</span>.
+          Digits & punctuation by keyboard (0-9 . , ! ? : ;).
+        </div>
+        <div class="pill" style="margin-top:6px">API: http://localhost:8000</div>
+      </div>
+
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <video id="webcam" autoplay muted playsinline style="display:none;"></video>
+        <div class="pill">Pinch = draw (index–thumb close)</div>
+      </div>
+    </div>
+
+    <h3>Text</h3>
+    <div id="text" class="textpane"></div>
+  </div>
+
+  <script>
+    const API_BASE = 'http://localhost:8000';
+    const pad = document.getElementById('pad');
+    const ctx = pad.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const textEl = document.getElementById('text');
+
+    // drawing style
+    const DRAW_THICKNESS = 12;
+    ctx.lineWidth = DRAW_THICKNESS;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#ffffff';
+    clearCanvas();
+
+    let drawing = false, last = null;
+    let textBuffer = "";
+    let history = [];
+    let lastTop3 = [];       // e.g. [{char:'H',prob:0.93}, ...]
+    let lastAddedIndex = null;
+
+    function clearCanvas(){
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0,0,pad.width,pad.height);
+    }
+    function setStatus(msg){ statusEl.textContent = msg; }
+    function updateText(){ textEl.textContent = textBuffer; }
+    function appendChar(ch){ textBuffer += ch; history.push({type:'add', ch}); updateText(); }
+    function backspace(){
+      if(!textBuffer) return;
+      const ch = textBuffer.slice(-1);
+      textBuffer = textBuffer.slice(0,-1);
+      history.push({type:'del', ch});
+      updateText();
+    }
+    function undo(){
+      if(!history.length) return;
+      const op = history.pop();
+      if(op.type==='add') textBuffer = textBuffer.slice(0,-1);
+      else if(op.type==='del') textBuffer += op.ch;
+      updateText();
+    }
+    function posFromEvent(e){
+      const r = pad.getBoundingClientRect();
+      const x = (e.touches? e.touches[0].clientX : e.clientX) - r.left;
+      const y = (e.touches? e.touches[0].clientY : e.clientY) - r.top;
+      return {x: Math.max(0, Math.min(pad.width, x)), y: Math.max(0, Math.min(pad.height, y))};
+    }
+    function penDown(p){ drawing = true; last = p; }
+    function penMove(p){
+      if(!drawing || !last) return;
+      ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+      last = p;
+    }
+    function penUp(){ drawing = false; last = null; }
+
+    // Mouse / Touch
+    pad.addEventListener('mousedown', e=>penDown(posFromEvent(e)));
+    pad.addEventListener('mousemove', e=>penMove(posFromEvent(e)));
+    window.addEventListener('mouseup', penUp);
+
+    pad.addEventListener('touchstart', e=>{ e.preventDefault(); penDown(posFromEvent(e)); });
+    pad.addEventListener('touchmove',  e=>{ e.preventDefault(); penMove(posFromEvent(e));  });
+    pad.addEventListener('touchend',   e=>{ e.preventDefault(); penUp();                   });
+
+    // Buttons
+    document.getElementById('btnClear').onclick = ()=>{ clearCanvas(); setStatus('Cleared'); };
+    document.getElementById('btnUndo').onclick  = ()=> undo();
+    document.getElementById('btnSpace').onclick = ()=> appendChar(' ');
+    document.getElementById('btnEnter').onclick = ()=> appendChar('\n');
+    document.getElementById('btnSave').onclick  = async ()=>{
+      try{
+        const res = await fetch(`${API_BASE}/api/save_text`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({text: textBuffer})
+        });
+        const js = await res.json();
+        setStatus(js.ok ? `Saved: ${js.path}` : 'Save failed');
+      }catch(e){ setStatus('Save error'); console.error(e); }
+    };
+
+    document.getElementById('btnPredict').onclick = async ()=>{ await doPredict(); };
+
+    // Keyboard
+    window.addEventListener('keydown', (e)=>{
+      if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+      if (e.key.length === 1 && /^[0-9\.\,\!\?\:\;]$/.test(e.key)) { appendChar(e.key); return; }
+      if (e.key === 'Backspace') { backspace(); e.preventDefault(); return; }
+      if (e.key === 'Enter') { appendChar('\n'); e.preventDefault(); return; }
+      if (e.key === ' ') { appendChar(' '); e.preventDefault(); return; }
+      // choose from last top-3
+      if (['1','2','3'].includes(e.key) && lastTop3.length){
+        const i = parseInt(e.key,10)-1;
+        if (lastAddedIndex !== null && i < lastTop3.length) {
+          const chars = textBuffer.split('');
+          chars[lastAddedIndex] = lastTop3[i].char;
+          textBuffer = chars.join('');
+          updateText();
+          setStatus(`Replaced with option ${i+1}: ${lastTop3[i].char}`);
+        }
+      }
+    });
+
+    async function doPredict(){
+      try {
+        setStatus('Predicting...');
+        const dataUrl = pad.toDataURL('image/png');
+        const res = await fetch(`${API_BASE}/api/predict`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({image: dataUrl})
+        });
+        const js = await res.json();
+        if(!js.ok){ setStatus(js.message || 'Predict failed'); return; }
+        appendChar(js.char);
+        lastAddedIndex = textBuffer.length - 1;
+        lastTop3 = js.top3 || [];
+        setStatus(`Pred: ${js.char} | Top3: ${lastTop3.map(t=>t.char).join(', ')}`);
+        clearCanvas();
+      } catch (e) {
+        setStatus('Predict error'); console.error(e);
+      }
+    }
+
+    // ---------- Webcam + MediaPipe Hands (optional) ----------
+    const video = document.getElementById('webcam');
+    let camera = null;
+    let webcamOn = false;
+    const PINCH_THRESHOLD = 0.07; // normalized
+
+    function toggleWebcam(){
+      webcamOn = !webcamOn;
+      video.style.display = webcamOn ? 'block' : 'none';
+      if (webcamOn){
+        startHands();
+      } else {
+        stopHands();
+      }
+    }
+    document.getElementById('btnWebcam').onclick = toggleWebcam;
+
+    let hands = null;
+    function startHands(){
+      if (hands) return;
+      hands = new Hands({locateFile: (file)=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      hands.onResults(onHandsResults);
+
+      camera = new Camera(video, {
+        onFrame: async () => { await hands.send({image: video}); },
+        width: 320, height: 240
+      });
+      camera.start();
+      setStatus('Webcam ON');
+    }
+    function stopHands(){
+      if (camera){ camera.stop(); camera = null; }
+      if (hands){ hands.close(); hands = null; }
+      setStatus('Webcam OFF');
+      drawing = false; last = null;
+    }
+
+    function onHandsResults(results){
+      if (!results.multiHandLandmarks || !webcamOn) { drawing = false; last = null; return; }
+      const h = results.multiHandLandmarks[0];
+      const iTip = h[8], tTip = h[4];
+      const dx = iTip.x - tTip.x, dy = iTip.y - tTip.y;
+      const dist = Math.hypot(dx, dy);
+      const pinch = dist < PINCH_THRESHOLD;
+
+      // Map normalized [0..1] to canvas coordinates (mirror X for natural feel)
+      const x = (1 - iTip.x) * pad.width;
+      const y = iTip.y * pad.height;
+      const p = {x, y};
+
+      if (pinch && !drawing){ penDown(p); }
+      else if (!pinch && drawing){ penUp(); }
+      else if (pinch && drawing){ penMove(p); }
+    }
+  </script>
+</body>
+</html>
